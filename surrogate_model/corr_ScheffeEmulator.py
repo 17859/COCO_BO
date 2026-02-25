@@ -1,24 +1,23 @@
-## matrix ScheffeMean
 import torch
 import itertools
+import torch
 import time
 import psutil
 import os
-import logging
-import json
 from functools import wraps
 from contextlib import redirect_stdout
+import logging
+import json
 
-from botorch.models import SingleTaskGP, ModelListGP
+
 from botorch.fit import fit_gpytorch_mll
 from botorch.models.transforms.outcome import Standardize
-from gpytorch.mlls import SumMarginalLogLikelihood
 from gpytorch.means import Mean
-from gpytorch.kernels import ScaleKernel, MaternKernel, RBFKernel
+from botorch.models import KroneckerMultiTaskGP
+from gpytorch.mlls import ExactMarginalLogLikelihood
 
-# ============================================================
-# Optimized Mean Function: FastScheffeMean
-# ============================================================
+
+
 class ScheffeMean(Mean):
     """
     優化後的 Scheffé 混合多項式均值函數。
@@ -71,9 +70,7 @@ class ScheffeMean(Mean):
 
         # 與權重 beta 做線性組合 (..., n)
         return torch.matmul(F, self.beta)
-
-
-
+    
 
 # ============================================================
 # Monitoring Utilities & Decorator
@@ -88,6 +85,10 @@ if not logger.handlers:
 
 
 
+
+# ============================================================
+# Decorator
+# ============================================================
 def monitor(runtime=True, memory=True, condition=False):
     def decorator(func):
         @wraps(func)
@@ -123,83 +124,105 @@ def monitor(runtime=True, memory=True, condition=False):
 
 
 
-# ============================================================
-# ScheffeTrendGPEmulator
-# ============================================================
-class ScheffeTrendGPEmulator:
+
+class CorrelationScheffeTrendGPEmulator:
+    """
+    Correlated Multi-Objective Gaussian Process Emulator
+    ====================================================
+
+    This class builds a multi-objective GP surrogate model:
+
+        y_k(z) = m_k(z) + g_k(z)
+
+    where:
+        m_k(z) = Scheffé polynomial trend
+        g_k(z) ~ GP(0, K_θ)
+
+    The correlation between objectives is modeled via
+    KroneckerMultiTaskGP.
+
+    Parameters
+    ----------
+    device : torch.device
+        Device for computation (CPU or GPU).
+
+    dtype : torch.dtype
+        Floating point precision.
+
+    scheffe_order : int
+        Polynomial order of Scheffé mean.
+
+    debug : bool
+        Enable runtime/memory diagnostics.
+    """
     def __init__(
         self,
         device        = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         dtype         = torch.double,
-        kernel        = 'rbf',
-        use_ard       = False,
-        matern_nu     = 2.5,
         scheffe_order = 2,
-        debug         = False,
+        debug         = False,   # Debug switch
+
     ):
         self.device = device
         self.dtype = dtype
-        self.kernel = kernel
-        self.use_ard = use_ard
-        self.matern_nu = matern_nu
+        self.model = None
+        self.mll = None
+
         self.scheffe_order = scheffe_order
         self.debug = debug
+
         self.performance_history = []
         self.current_iter = 0
         self.model = None
 
-    def _build_kernel(self, input_dim):
-        ard_dims = input_dim if self.use_ard else None
-        if self.kernel == "matern":
-            base_kernel = MaternKernel(nu=self.matern_nu, ard_num_dims=ard_dims)
-        else:
-            base_kernel = RBFKernel(ard_num_dims=ard_dims)
-        return ScaleKernel(base_kernel)
 
-    @monitor(runtime=True, memory=True, condition=True)
+    @monitor(runtime=True, memory=True, condition=False)
     def fit(self, train_x: torch.Tensor, train_obj: torch.Tensor):
-        # 確保數據類型與設備一致
-        train_x = train_x.to(device=self.device, dtype=self.dtype)
-        train_obj = train_obj.to(device=self.device, dtype=self.dtype)
+        """
+        Fit the multi-task GP model.
 
+        Parameters
+        ----------
+        train_x : torch.Tensor
+            Shape (N, d)
+
+        train_obj : torch.Tensor
+            Shape (N, k)
+            k = number of objectives
+        """
+
+        # If single objective (N,), convert to (N, 1)
         if train_obj.ndim == 1:
             train_obj = train_obj.unsqueeze(-1)
 
         input_dim = train_x.shape[-1]
         num_objectives = train_obj.shape[-1]
-        models = []
 
-        for i in range(num_objectives):
-            covar_module = self._build_kernel(input_dim)
 
-            # --- 使用 ScheffeMean ---
-            mean_module = ScheffeMean(
-                input_dim=input_dim,
-                order=self.scheffe_order,
-            ).to(device=self.device, dtype=self.dtype) 
+        # Define Scheffé polynomial mean
+        mean_module = ScheffeMean(
+            input_dim=input_dim,
+            order=self.scheffe_order,
+        )  
 
-            train_y = train_obj[..., i:i + 1]
 
-            gp = SingleTaskGP(
-                train_X=train_x,
-                train_Y=train_y,
-                mean_module=mean_module,
-                outcome_transform=Standardize(m=1),
-                covar_module=covar_module,
-            )
-            models.append(gp)
+        # Construct correlated multi-task GP
+        self.model = KroneckerMultiTaskGP(
+            train_X=train_x,
+            train_Y=train_obj,
+            outcome_transform=Standardize(m=num_objectives),
+            mean_module = mean_module
+        )
 
-        self.model = ModelListGP(*models).to(device=self.device, dtype=self.dtype)
-        self.mll = SumMarginalLogLikelihood(self.model.likelihood, self.model)
+        # Exact marginal log likelihood
+        self.mll = ExactMarginalLogLikelihood(self.model.likelihood, self.model)
 
-        # 靜默訓練過程
         with open(os.devnull, 'w') as f:
             with redirect_stdout(f):
                 fit_gpytorch_mll(self.mll)
 
         return self.model
-
-
+    
     def save_performance_to_json(self, folder_path, filename="performance_report.json"):
         """
         將監控紀錄儲存至指定資料夾路徑。
@@ -220,11 +243,33 @@ class ScheffeTrendGPEmulator:
         except Exception as e:
             logger.error(f"Failed to save JSON: {str(e)}")
 
-
+            
+    
     @torch.no_grad()
-    def predict(self, X):
+    def predict(self, X ):
+        """
+        Posterior prediction.
+
+        Parameters
+        ----------
+        X : torch.Tensor or array-like
+            Shape (n, d)
+
+        Returns
+        -------
+        mean : torch.Tensor
+            Posterior predictive mean, shape (n, k)
+
+        var : torch.Tensor
+            Posterior predictive variance, shape (n, k)
+        """
+
         if self.model is None:
             raise RuntimeError("Model has not been fitted yet.")
+        
         X = torch.as_tensor(X, dtype=self.dtype, device=self.device)
         posterior = self.model.posterior(X)
-        return posterior.mean, posterior.variance
+        mean = posterior.mean    # (n, k)
+        var = posterior.variance # (n, k)
+
+        return mean, var

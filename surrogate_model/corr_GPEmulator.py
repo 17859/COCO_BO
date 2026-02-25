@@ -1,23 +1,19 @@
-from botorch.models import SingleTaskGP, ModelListGP
+from botorch.models import KroneckerMultiTaskGP
+from botorch.fit import fit_gpytorch_mll
+from gpytorch.mlls import ExactMarginalLogLikelihood
+from botorch.models.transforms.outcome import Standardize
+
+
+import logging
+import json
 import torch
 import time
 import psutil
 import os
 from functools import wraps
 from contextlib import redirect_stdout
-import logging
-import json
-
-
 from botorch.fit import fit_gpytorch_mll
 from botorch.models.transforms.outcome import Standardize
-from gpytorch.mlls import SumMarginalLogLikelihood
-from gpytorch.kernels import (
-    ScaleKernel,
-    MaternKernel,
-    RBFKernel,
-)
-
 
 
 # --- Logging 配置 ---
@@ -31,11 +27,9 @@ if not logger.handlers:
 
 
 
-
 # ============================================================
 # Decorator
 # ============================================================
-
 def monitor(runtime=True, memory=True, condition=False):
     def decorator(func):
         @wraps(func)
@@ -93,164 +87,81 @@ def monitor(runtime=True, memory=True, condition=False):
 
 
 
-
-class BaselineGPEmulator:
+class CorrelationBaselineGPEmulator:
     """
-    Baseline Multi-Objective GP Emulator
-    =====================================
+    Correlation Baseline Multi-Objective GP Emulator
+    =================================================
 
-    This class implements a multi-objective Gaussian Process (GP)
-    surrogate model using independent SingleTaskGP models.
+    This implementation uses KroneckerMultiTaskGP to jointly model
+    multiple objectives while learning correlations between tasks.
 
     Mathematical Form:
 
-        y_k(z) = m_k(z) + g_k(z)
+        Y = f(X) + ε
+        f ~ MultiTaskGP(m, K_x ⊗ K_t)
 
-        m_k(z) : constant mean (default in SingleTaskGP)
-        g_k(z) ~ GP(0, K_{θ_k})
+    where:
 
-    Each objective is modeled with an independent GP.
+        K_x : covariance function over input space
+        K_t : task covariance matrix modeling inter-task correlation
 
-    Example:
-        >>> import torch
-        >>> from baseline_gp_emulator import BaselineGPEmulator
-        >>>
-        >>> # Generate training data
-        >>> train_X = torch.rand(20, 3, dtype=torch.double)
-        >>> train_Y = torch.rand(20, 2, dtype=torch.double)
-        >>>
-        >>> # Create emulator
-        >>>
-        >>> # method1 : RBF is defult
-        >>> emulator = BaselineGPEmulator()  #defult = RBF
-        >>>
-        >>> # method2 : matern
-        >>> emulator = BaselineGPEmulator(
-        ...     kernel="matern"
-        ... )
-        >>>
-        >>> # Fit model
-        >>> model = emulator.fit(train_X, train_Y)
-        >>>
-        >>> # Make predictions
-        >>> test_X = torch.rand(5, 3, dtype=torch.double)
-        >>> mean, var = emulator.predict(test_X)
-        >>>
-        >>> mean.shape
-        torch.Size([5, 2])
-        >>> var.shape
-        torch.Size([5, 2])
+    Note:
+        KroneckerMultiTaskGP requires all tasks to share
+        the same training inputs (fully observed design).
     """
+
 
     def __init__(
         self,
         device  = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         dtype   = torch.double,
-        kernel    = "rbf",      # "rbf" or "matern"
-        use_ard   = False,       # Whether to use Automatic Relevance Determination
-        matern_nu = 2.5,         # Smoothness parameter for Matern kernel
-        debug=False,   # Debug switch
-        
-    
+        debug   = False,
     ):
         self.device = device
         self.dtype = dtype
         self.model = None
         self.mll = None
-
-        self.kernel = kernel
-        self.use_ard = use_ard
-        self.matern_nu = matern_nu
         self.debug = debug
         self.performance_history = []
         self.current_iter = 0
 
 
-    def _build_kernel(self, input_dim):
-
-        """
-        Construct covariance kernel based on configuration.
-
-        If ARD is enabled, each input dimension has its own
-        independent lengthscale parameter.
-        """
-
-
-        ard_dims = input_dim if self.use_ard else None
-
-        if self.kernel == "matern":
-            base_kernel = MaternKernel(
-                nu=self.matern_nu,
-                ard_num_dims=ard_dims,
-            )
-        else:  # default: RBF
-            base_kernel = RBFKernel(
-                ard_num_dims=ard_dims,
-            )
-
-        # ScaleKernel allows the model to learn an output scale parameter
-        return ScaleKernel(base_kernel)
-
 
     @monitor(runtime=True, memory=True, condition=True)
     def fit(self, train_x: torch.Tensor, train_obj: torch.Tensor):
         """
-        Fit the multi-objective GP surrogate model.
+        Fit a Kronecker Multi-Task GP model.
 
-        Parameters
-        ----------
-        train_x : torch.Tensor
-            Training inputs of shape (N, d)
-
-        train_obj : torch.Tensor
-            Training objectives of shape (N, k)
-
-        Returns
-        -------
-        ModelListGP
-            A ModelListGP containing independent SingleTaskGP models
-            for each objective.
+        Important:
+            KroneckerMultiTaskGP assumes that all tasks are observed
+            at the same set of training input locations.
         """
 
-        # If single objective (N,), convert to (N, 1)
+        # Convert single-objective case (N,) to (N, 1)
         if train_obj.ndim == 1:
             train_obj = train_obj.unsqueeze(-1)
 
-        input_dim = train_x.shape[-1]
-        num_objectives = train_obj.shape[-1]
+        num_tasks = train_obj.shape[-1]
 
-        models = []
-        
-        # Build one independent GP per objective
-        for i in range(num_objectives):
-            covar_module = self._build_kernel(input_dim)
-
-            train_y = train_obj[..., i:i + 1]  # (N, 1)
-
-            gp = SingleTaskGP(
-                train_X=train_x,
-                train_Y=train_y,
-                outcome_transform=Standardize(m=1),
-                covar_module=covar_module,
-            )
-            models.append(gp)
-
-        # Combine independent GPs into ModelListGP
-        self.model = ModelListGP(*models)
-
-        # Define marginal log likelihood for multi-model case
-        self.mll = SumMarginalLogLikelihood(
-            self.model.likelihood, self.model
+        # Construct the Kronecker Multi-Task GP
+        # The model automatically learns the task covariance matrix
+        self.model = KroneckerMultiTaskGP(
+            train_X=train_x,
+            train_Y=train_obj,
+            outcome_transform=Standardize(m=num_tasks),
         )
+
+        # Multi-task GP uses ExactMarginalLogLikelihood
+        self.mll = ExactMarginalLogLikelihood(self.model.likelihood, self.model)
+
+        # Train model while suppressing optimization output
         with open(os.devnull, 'w') as f:
             with redirect_stdout(f):
                 fit_gpytorch_mll(self.mll)
 
-
-        # Maximize marginal log likelihood
-        fit_gpytorch_mll(self.mll)
-
         return self.model
+
+
 
 
     def save_performance_to_json(self, folder_path, filename="performance_report.json"):
@@ -274,35 +185,27 @@ class BaselineGPEmulator:
             logger.error(f"Failed to save JSON: {str(e)}")
 
 
+
     @torch.no_grad()
-    def predict(self, X ):
+    def predict(self, X: torch.Tensor):
         """
-        Predict using the trained GP surrogate.
+        Perform prediction using the trained model.
 
-        Parameters
-        ----------
-        X : torch.Tensor or array-like
-            Input locations of shape (n, d)
-
-        Returns
-        -------
-        mean : torch.Tensor
-            Posterior predictive mean of shape (n, k)
-
-        var : torch.Tensor
-            Posterior predictive variance of shape (n, k)
+        Returns:
+            posterior.mean      : shape (n, num_tasks)
+            posterior.variance  : shape (n, num_tasks)
         """
-
         if self.model is None:
             raise RuntimeError("Model has not been fitted yet.")
         
         X = torch.as_tensor(X, dtype=self.dtype, device=self.device)
+        
+        # Switch to evaluation mode
+        self.model.eval()
+        self.model.likelihood.eval()
+        
         posterior = self.model.posterior(X)
-        mean = posterior.mean    # (n, k)
-        var = posterior.variance # (n, k)
-
-        return mean, var
-
-
-
-
+        
+        # mean shape: (n, num_tasks)
+        # variance shape: (n, num_tasks)
+        return posterior.mean, posterior.variance
