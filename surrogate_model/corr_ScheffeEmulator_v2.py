@@ -179,7 +179,7 @@ if not logger.handlers:
 
 
 # ============================================================
-# Decorator
+# Monitor Decorator
 # ============================================================
 def monitor(runtime=True, memory=True, condition=False):
     def decorator(func):
@@ -187,9 +187,10 @@ def monitor(runtime=True, memory=True, condition=False):
         def wrapper(self, *args, **kwargs):
             if not getattr(self, "debug", False):
                 return func(self, *args, **kwargs)
+            
             if not hasattr(self, 'performance_history'):
                 self.performance_history = []
-            
+
             start_time = time.perf_counter()
             process = psutil.Process(os.getpid())
             
@@ -205,9 +206,31 @@ def monitor(runtime=True, memory=True, condition=False):
                 "cpu_memory_mb": round(cpu_mem, 2),
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
             }
+
             if torch.cuda.is_available():
                 entry["gpu_alloc_mb"] = round(torch.cuda.memory_allocated() / 1024**2, 2)
-            
+
+            # --- 修復後的條件數計算邏輯 ---
+            if condition and getattr(self, "model", None) is not None:
+                cond_list = []
+                # 判斷是 ModelList 還是單一模型 (KMTGP/STGP)
+                sub_models = self.model.models if hasattr(self.model, "models") else [self.model]
+                
+                for m in sub_models:
+                    try:
+                        with torch.no_grad():
+                            # 獲取訓練協方差矩陣
+                            # 注意：KMTGP 的矩陣可能非常大，這裡做 to_dense 會很吃記憶體
+                            K = m.covar_module(m.train_inputs[0]).to_dense()
+                            # 加上 jitter 提高穩定性
+                            K += torch.eye(K.size(-1), device=K.device, dtype=K.dtype) * 1e-6
+                            eigvals = torch.linalg.eigvalsh(K)
+                            cond = (eigvals.max() / eigvals.min()).item()
+                            cond_list.append(cond)
+                    except Exception as e:
+                        cond_list.append(float('nan'))
+                entry["condition_numbers"] = cond_list
+
             self.performance_history.append(entry)
             logger.info(f"Finished {func.__name__} - {entry}")
             return result
